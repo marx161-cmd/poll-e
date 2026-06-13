@@ -1,66 +1,109 @@
 # Poll-E
 
-Poll-E is an experimental on-device ambient suggestion worker for a rooted Pixel
-with Tensor G5 NPU support. The current proof point is a patched LiteRT-LM
-Android runner that can load Google's Gemma 3 1B Tensor G5 package, read screen
-snapshot text from stdin, and emit bounded suggestion blocks.
+Poll-E is an experimental on-device ambient suggestion daemon for a rooted Pixel
+10 Pro (Tensor G5). It consists of three components that share a signing key:
+
+| Component | Status | Package |
+|-----------|--------|---------|
+| LiteRT-LM worker | **Working** | native binary, `com.termux.*` Termux |
+| AccessibilityService APK | **Skeleton (builds)** | `com.termux.suggest` |
+| PixelXpert fork with slot | Planned | `com.termux.*` |
 
 The repository is source-first. Large local recovery trees, model files, and
 runtime binaries are intentionally not committed.
 
-## Current State
+## Current State (2026-06-13)
 
-- Device target: Pixel 10 Pro / Tensor G5 / Android 16.
-- Model tested: Google Gemma 3 1B Tensor G5 LiteRT-LM package.
-- Runtime path: LiteRT-LM built with Bazel and Android NDK r29.
-- Worker protocol: line-based stdin snapshots; `POLL_E_READY`, then
-  `POLL_E_BEGIN` / `POLL_E_END` response blocks.
-- Baseline profile source: `--poll_e_profile_file=/path/to/profile.txt`.
-- Current safe behavior: one loaded engine, fresh conversation/session per poll.
-  This prevents history growth but re-prefills the profile baseline per poll.
+- **Device target:** Pixel 10 Pro / Tensor G5 / Android 16.
+- **Model tested:** Google Gemma 3 1B Tensor G5 LiteRT-LM package.
+- **Runtime:** LiteRT-LM built with Bazel and Android NDK r29, running on NPU.
+- **Worker confirmed generating suggestions:** `POLL_E_BEGIN / Want to meet at 7 / POLL_E_END`
+  for a Messages context. Prompt: direct completion framing (not role-playing).
+- **AccessibilityService APK skeleton:** compiles and builds; wires accessibility
+  tree walk → debounce/dedup → worker IPC → broadcast. No PixelXpert IPC yet.
 
-## Important NPU Limitation
+## Architecture
 
-The Tensor G5 NPU executor currently blocks the ideal reusable-prefix KV design
-through public LiteRT-LM APIs:
+```
+context change
+  → AccessibilityEvent (doorbell: WINDOW_STATE_CHANGED / VIEW_FOCUSED)
+  → debounce 300 ms
+  → accessibility tree-walk → flatten to snapshot string
+  → dedup hash  ── identical? ──> skip
+  → litert_lm_main (stdin/stdout via su, NPU)
+  → POLL_E_BEGIN / suggestion text / POLL_E_END
+  → output gate (NONE? skip. blank? skip.)
+  → ACTION_SUGGESTION broadcast  [→ PixelXpert slot, TODO]
+  → vol-up: accept / vol-down: dismiss  [TODO]
+```
 
-- `RewindToCheckpoint()` fails with:
-  `NPU executor's SetCurrentStep only supports rolling back one token at the end of decode`.
-- `Conversation::Clone()` fails with:
-  `GetRuntimeConfig not implemented for backend: LiteRT NPU Compiled Model`.
+## Worker Protocol
 
-The next runtime research target is a backend-specific way to export/import or
-reuse prefix KV/cache state without relying on those public session mechanisms.
+The native binary speaks a line-based stdin/stdout protocol:
+
+```
+POLL_E_READY           ← one-time on startup (after model loads, ~2 s on NPU)
+<snapshot line>\n      → stdin from APK
+POLL_E_BEGIN           ← start of response
+<suggestion text>      ← actual text, or NONE if no text field visible
+POLL_E_END             ← end of response
+```
+
+Ignore all stdout before `POLL_E_READY`; the native dispatch lib can print
+startup noise on the same line.
+
+## Worker Binary
+
+Built with Bazel + NDK r29 from the LiteRT-LM working copy.
+
+SHA256 (v2, direct-completion prompt, 2026-06-13):
+
+```
+39c7598c386dba024248dc15a87325584de435ec79505306575e57adb86b765c
+```
+
+Local backup: `runtime-backup-2026-06-13/poll-e-worker-bazel-r29/litert_lm_main`  
+Phone path: `/data/local/tmp/poll-e-worker-test/litert_lm_main`
+
+## NPU Limitations
+
+The Tensor G5 NPU executor blocks the ideal reusable-prefix KV design via public
+LiteRT-LM APIs:
+
+- `RewindToCheckpoint()` → `NPU executor's SetCurrentStep only supports rolling
+  back one token at the end of decode`.
+- `Conversation::Clone()` → `GetRuntimeConfig not implemented for backend: LiteRT
+  NPU Compiled Model`.
+
+Workaround: one loaded engine, fresh conversation per poll. Re-prefills the
+profile baseline each poll; prevents history growth.
 
 ## Files
 
-- `Poll-E-Concept.md` - product and architecture concept.
-- `runtime.md` - current runtime findings, exact commands, tests, and limits.
-- `source-patches/litert-lm-poll-e-worker-2026-06-13.patch` - patch to apply to
-  the preserved LiteRT-LM working tree.
-- `run-gemma3-1b-npu.sh`, `push-runtime-wrapper.sh`,
-  `termux-poll-e-gemma3-1b-npu` - local helper scripts from the current setup.
+- `Poll-E-Concept.md` — full product and architecture concept.
+- `runtime.md` — runtime findings, exact commands, performance numbers, limits.
+- `RECREATE.md` — step-by-step build and staging guide.
+- `source-patches/litert-lm-poll-e-worker-2026-06-13.patch` — patch for
+  `runtime/engine/litert_lm_main.cc` and the NPU stub guard.
+- `poll-e-service/` — AccessibilityService APK source (Kotlin, AGP 8.7, API 36).
 
-## Tested Binary
+## Building the APK
 
-Final tested worker binary SHA256:
-
-```text
-c6f72a80fd647f74cf4d9e172f7d222251751498e24f0fd19937ca02f793af07
+```bash
+cd poll-e-service
+# Set ANDROID_HOME or let local.properties point to the SDK.
+export ANDROID_HOME=/home/comrade/lib/android-sdk-9123335
+./gradlew assembleDebug
+# APK: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Local backup path on the homelab machine:
+The debug APK is unsigned with the debug keystore. For production, sign it with
+the same key used for the rest of the Termux family so `signature`-level IPC
+works across components.
 
-```text
-/home/comrade/homelab/Poll-E/runtime-backup-2026-06-13/poll-e-worker-bazel-r29/litert_lm_main
-```
+**Root access required:** grant `com.termux.suggest` root in APatch settings
+before enabling the accessibility service.
 
-Phone staging path:
-
-```text
-/data/local/tmp/poll-e-worker-test/litert_lm_main
-```
-
-## Recreate
+## Recreate Worker
 
 See `RECREATE.md`.

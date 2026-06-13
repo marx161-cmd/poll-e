@@ -1,5 +1,5 @@
 diff --git a/runtime/engine/litert_lm_main.cc b/runtime/engine/litert_lm_main.cc
-index 6dae7590..47b2de4c 100644
+index 6dae7590..8c01ad61 100644
 --- a/runtime/engine/litert_lm_main.cc
 +++ b/runtime/engine/litert_lm_main.cc
 @@ -50,11 +50,26 @@
@@ -41,7 +41,7 @@ index 6dae7590..47b2de4c 100644
  using ::nlohmann::json;
  
  absl::AnyInvocable<void(absl::StatusOr<Message>)> CreateMessageCallback() {
-@@ -84,34 +101,133 @@ absl::AnyInvocable<void(absl::StatusOr<Message>)> CreateMessageCallback() {
+@@ -84,34 +101,131 @@ absl::AnyInvocable<void(absl::StatusOr<Message>)> CreateMessageCallback() {
    };
  }
  
@@ -98,13 +98,11 @@ index 6dae7590..47b2de4c 100644
 +}
 +
 +std::string BuildPollEPrompt(const std::string& snapshot) {
-+  return "You are Poll-E, an on-device writing suggestion gate. Use only the "
-+         "current screen snapshot below; ignore older screen snapshots. If no "
-+         "text insertion would be useful right now, reply exactly NONE. If a "
-+         "text insertion would help, reply with only the exact text to insert, "
-+         "with no quotes, no markdown, and no explanation.\n\nCurrent screen "
-+         "snapshot:\n" +
-+         snapshot;
++  return "Phone screen snapshot:\n" + snapshot +
++         "\n\nBased on the snapshot above, complete the text in the focused "
++         "input field. Reply with only the text to type, no quotes, no "
++         "markdown, no explanation. Keep it short and natural. If no text "
++         "field is visible or focused, reply NONE.";
 +}
 +
 +absl::Status RunPollEWorker(litert::lm::Engine& engine,
@@ -192,7 +190,7 @@ index 6dae7590..47b2de4c 100644
    // Overrides the default for FLAGS_minloglevel to error.
    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kError);
    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kFatal);
-@@ -128,6 +244,12 @@ absl::Status MainHelper(int argc, char** argv) {
+@@ -128,6 +242,12 @@ absl::Status MainHelper(int argc, char** argv) {
    ASSIGN_OR_RETURN(
        EngineSettings engine_settings,
        EngineSettings::CreateDefault(std::move(model_assets), backend));
@@ -205,7 +203,7 @@ index 6dae7590..47b2de4c 100644
    // Enable benchmark by default.
    engine_settings.GetMutableBenchmarkParams() =
        litert::lm::proto::BenchmarkParams();
-@@ -139,24 +261,36 @@ absl::Status MainHelper(int argc, char** argv) {
+@@ -139,24 +259,36 @@ absl::Status MainHelper(int argc, char** argv) {
    // Create the conversation.
    std::unique_ptr<Conversation> conversation;
    auto session_config = litert::lm::SessionConfig::CreateDefault();

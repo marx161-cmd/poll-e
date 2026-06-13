@@ -118,3 +118,31 @@ POLL_E_END
 
 Native dispatch may print a startup line before `POLL_E_READY`; callers should
 ignore output until ready.
+
+Confirmed output (2026-06-13 v2 binary, Messages context):
+
+```text
+POLL_E_READY
+POLL_E_BEGIN
+Want to meet at 7
+POLL_E_END
+```
+
+## 5. AccessibilityService APK
+
+Source lives in `poll-e-service/`. Build with:
+
+```bash
+cd poll-e-service
+export ANDROID_HOME=/home/comrade/lib/android-sdk-9123335
+./gradlew assembleDebug
+adb -s 100.69.13.12:5555 install app/build/outputs/apk/debug/app-debug.apk
+```
+
+Then on the phone:
+1. Grant root access to `com.termux.suggest` in APatch.
+2. Settings → Accessibility → Poll-E → enable.
+3. Monitor suggestions: `adb logcat -s PollE:D`
+
+The service spawns the worker binary via `su` when it connects. Expect ~2 s
+startup before the first suggestion can be generated.

@@ -160,10 +160,10 @@ Local backup:
 /home/comrade/homelab/Poll-E/runtime-backup-2026-06-13/poll-e-worker-bazel-r29/litert_lm_main
 ```
 
-SHA256:
+SHA256 (v2, direct-completion prompt fix, 2026-06-13):
 
 ```text
-c6f72a80fd647f74cf4d9e172f7d222251751498e24f0fd19937ca02f793af07
+39c7598c386dba024248dc15a87325584de435ec79505306575e57adb86b765c
 ```
 
 Smoke tests on the Pixel succeeded:
@@ -185,37 +185,46 @@ Time to first token: 0.23 s
 Decode Speed: 11.55 tokens/sec
 ```
 
-Resident worker smoke:
+Resident worker smoke (v2 — generates actual suggestions):
 
 ```bash
-printf "%s\n%s\n" \
-  "App: Messages. Focused input contains: hello. Recent chat asks: Want to meet at 7?" \
-  "__quit__" |
-LD_LIBRARY_PATH=/data/local/tmp/poll-e-worker-test \
-  /data/local/tmp/poll-e-worker-test/litert_lm_main \
-  --backend=npu \
-  --model_path=/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm \
-  --poll_e_worker \
-  --poll_e_max_output_tokens=24
+adb -s 100.69.13.12:5555 shell 'cd /data/local/tmp/poll-e-worker-test && \
+  printf "%s\n%s\n" \
+    "App: Messages. Focused input contains: hello. Recent chat asks: Want to meet at 7?" \
+    "__quit__" | \
+  LD_LIBRARY_PATH=/data/local/tmp/poll-e-worker-test ./litert_lm_main \
+    --backend=npu \
+    --model_path=/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm \
+    --poll_e_worker \
+    --poll_e_max_output_tokens=24'
 ```
 
-Observed protocol:
+Observed output (2026-06-13 v2):
 
 ```text
 POLL_E_READY
 POLL_E_BEGIN
-NONE
+Want to meet at 7
 POLL_E_END
 ```
 
-Final multi-request smoke:
+### Prompt engineering note
 
-```text
-POLL_E_READY
-POLL_E_BEGIN
-NONE
-POLL_E_END
-POLL_E_BEGIN
-NONE
-POLL_E_END
+The original prompt used complex role-playing gate instructions
+("You are Poll-E... if no insertion would be useful, reply exactly NONE")
+which caused Gemma 3 1B to return NONE conservatively for all inputs.
+
+The fix changes `BuildPollEPrompt` to a direct completion frame:
+
 ```
+Phone screen snapshot:
+{snapshot}
+
+Based on the snapshot above, complete the text in the focused
+input field. Reply with only the text to type, no quotes, no
+markdown, no explanation. Keep it short and natural. If no text
+field is visible or focused, reply NONE.
+```
+
+This produces natural completions for Messages/Gmail contexts and
+correctly returns NONE for screens with no focused text field.
