@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Declared on the service tag below; not a uses-permission -->
+    <!-- IPC permission: only apps signed with the same key (PixelXpert fork) can receive suggestion broadcasts -->
+    <permission
+        android:name="com.termux.suggest.permission.POLL_E_IPC"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.termux.suggest.permission.POLL_E_IPC" />
 
     <application
         android:label="Poll-E"

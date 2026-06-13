@@ -72,12 +72,11 @@ class PollEAccessibilityService : AccessibilityService() {
         }
         Log.i(TAG, "Suggestion: $text")
 
-        // Skeleton output: broadcast within the app for now.
-        // TODO: replace with signature-protected ContentProvider for PixelXpert IPC.
-        sendBroadcast(Intent(ACTION_SUGGESTION).apply {
-            putExtra(EXTRA_TEXT, text)
-            `package` = packageName
-        })
+        // Send to PixelXpert's SystemUI hook. Permission enforces only same-signed apps receive it.
+        sendBroadcast(
+            Intent(ACTION_SUGGESTION).apply { putExtra(EXTRA_TEXT, text) },
+            PERMISSION_POLL_E_IPC
+        )
     }
 
     override fun onInterrupt() {
@@ -96,5 +95,6 @@ class PollEAccessibilityService : AccessibilityService() {
 
         const val ACTION_SUGGESTION = "com.termux.suggest.SUGGESTION"
         const val EXTRA_TEXT = "text"
+        const val PERMISSION_POLL_E_IPC = "com.termux.suggest.permission.POLL_E_IPC"
     }
 }
