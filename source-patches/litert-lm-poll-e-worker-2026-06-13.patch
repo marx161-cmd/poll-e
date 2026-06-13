@@ -1,0 +1,452 @@
+diff --git a/runtime/engine/litert_lm_main.cc b/runtime/engine/litert_lm_main.cc
+index 6dae7590..47b2de4c 100644
+--- a/runtime/engine/litert_lm_main.cc
++++ b/runtime/engine/litert_lm_main.cc
+@@ -50,11 +50,26 @@
+ #include "runtime/util/status_macros.h"
+ 
+ ABSL_FLAG(std::string, backend, "gpu",
+-          "Executor backend to use for LLM execution (cpu, gpu, etc.)");
++          "Executor backend to use for LLM execution (cpu, gpu, npu, etc.)");
+ ABSL_FLAG(std::string, model_path, "", "Model path to use for LLM execution.");
+ ABSL_FLAG(std::string, input_prompt, "",
+           "Input prompt to use for testing LLM execution.");
+ ABSL_FLAG(std::string, input_prompt_file, "", "File path to the input prompt.");
++ABSL_FLAG(std::string, litert_dispatch_lib_dir, "",
++          "Directory containing LiteRT NPU dispatch library (e.g. "
++          "libLiteRtDispatch_GoogleTensor.so). Required for --backend=npu.");
++ABSL_FLAG(bool, poll_e_worker, false,
++          "Keep the model resident and read Poll-E screen snapshots from "
++          "stdin, emitting one bounded suggestion per request.");
++ABSL_FLAG(std::string, poll_e_profile_file, "",
++          "Optional Poll-E profile/policy file to prefill once at startup.");
++ABSL_FLAG(int32_t, poll_e_max_output_tokens, 48,
++          "Maximum tokens to decode for each Poll-E worker response.");
++
++namespace litert::lm {
++// Defined in engine_advanced_impl.cc — explicit call avoids static-init GC.
++void RegisterAdvancedEngine();
++}  // namespace litert::lm
+ 
+ namespace {
+ 
+@@ -63,8 +78,10 @@ using ::litert::lm::Conversation;
+ using ::litert::lm::ConversationConfig;
+ using ::litert::lm::EngineSettings;
+ using ::litert::lm::InputData;
++using ::litert::lm::JsonPreface;
+ using ::litert::lm::Message;
+ using ::litert::lm::ModelAssets;
++using ::litert::lm::OptionalArgs;
+ using ::nlohmann::json;
+ 
+ absl::AnyInvocable<void(absl::StatusOr<Message>)> CreateMessageCallback() {
+@@ -84,34 +101,133 @@ absl::AnyInvocable<void(absl::StatusOr<Message>)> CreateMessageCallback() {
+   };
+ }
+ 
++absl::StatusOr<std::string> ReadTextFile(const std::string& path) {
++  std::ifstream file(path);
++  if (!file.is_open()) {
++    return absl::NotFoundError("Could not open file: " + path);
++  }
++  std::stringstream buffer;
++  buffer << file.rdbuf();
++  return buffer.str();
++}
++
++Message MakeTextMessage(const std::string& role, const std::string& text) {
++  json content_list = json::array();
++  content_list.push_back({{"type", "text"}, {"text", text}});
++  return json::object({{"role", role}, {"content", content_list}});
++}
++
++std::string ExtractMessageText(const Message& message) {
++  if (!message.contains("content")) return "";
++  const auto& content = message["content"];
++  if (content.is_string()) return content.get<std::string>();
++  if (!content.is_array()) return "";
++
++  std::string text;
++  for (const auto& item : content) {
++    if (item.is_string()) {
++      text += item.get<std::string>();
++    } else if (item.contains("text") && item["text"].is_string()) {
++      text += item["text"].get<std::string>();
++    }
++  }
++  return text;
++}
++
+ // Gets the input prompt from the command line flag or file.
+-std::string GetInputPrompt() {
++absl::StatusOr<std::string> GetInputPrompt() {
+   const std::string input_prompt = absl::GetFlag(FLAGS_input_prompt);
+   const std::string input_prompt_file = absl::GetFlag(FLAGS_input_prompt_file);
+   if (!input_prompt.empty() && !input_prompt_file.empty()) {
+-    ABSL_LOG(FATAL) << "Only one of --input_prompt and --input_prompt_file can "
+-                       "be specified.";
++    return absl::InvalidArgumentError(
++        "Only one of --input_prompt and --input_prompt_file can be specified.");
+   }
+-  if (!input_prompt.empty()) {
+-    return input_prompt;
++  if (!input_prompt.empty()) return input_prompt;
++  if (!input_prompt_file.empty()) return ReadTextFile(input_prompt_file);
++  // If no input prompt is provided, use the default prompt.
++  return "What is the tallest building in the world?";
++}
++
++std::string BuildPollEPrompt(const std::string& snapshot) {
++  return "You are Poll-E, an on-device writing suggestion gate. Use only the "
++         "current screen snapshot below; ignore older screen snapshots. If no "
++         "text insertion would be useful right now, reply exactly NONE. If a "
++         "text insertion would help, reply with only the exact text to insert, "
++         "with no quotes, no markdown, and no explanation.\n\nCurrent screen "
++         "snapshot:\n" +
++         snapshot;
++}
++
++absl::Status RunPollEWorker(litert::lm::Engine& engine,
++                            const ConversationConfig& conversation_config) {
++  const int max_output_tokens = absl::GetFlag(FLAGS_poll_e_max_output_tokens);
++  std::cout << "POLL_E_READY" << std::endl;
++
++  std::string snapshot;
++  while (std::getline(std::cin, snapshot)) {
++    if (snapshot == "__quit__") break;
++    if (snapshot.empty()) {
++      std::cout << "POLL_E_BEGIN\nNONE\nPOLL_E_END" << std::endl;
++      continue;
++    }
++
++    OptionalArgs optional_args;
++    optional_args.max_output_tokens = max_output_tokens;
++    optional_args.enable_thinking = false;
++    ASSIGN_OR_RETURN(std::unique_ptr<Conversation> request_conversation,
++                     Conversation::Create(engine, conversation_config));
++    ASSIGN_OR_RETURN(
++        Message response,
++        request_conversation->SendMessage(
++            MakeTextMessage("user", BuildPollEPrompt(snapshot)),
++            std::move(optional_args)));
++    std::cout << "POLL_E_BEGIN\n"
++              << ExtractMessageText(response)
++              << "\nPOLL_E_END" << std::endl;
+   }
+-  if (!input_prompt_file.empty()) {
+-    std::ifstream file(input_prompt_file);
+-    if (!file.is_open()) {
+-      std::cerr << "Error: Could not open file " << input_prompt_file
+-                << std::endl;
+-      return "";
++
++  return absl::OkStatus();
++}
++
++void ParseManualFlags(int argc, char** argv) {
++  // absl::ParseCommandLine requires flags registered in the global registry,
++  // but FlagRegistrar initialization is elided by -O3 (constexpr + trivial
++  // FlagRegistrarEmpty). Parse argv manually and set flags directly instead.
++  for (int i = 1; i < argc; ++i) {
++    std::string_view arg(argv[i]);
++    if (arg.size() < 3 || arg[0] != '-' || arg[1] != '-') continue;
++    arg.remove_prefix(2);
++    auto eq = arg.find('=');
++    std::string key;
++    std::string val;
++    if (eq == std::string_view::npos) {
++      key = std::string(arg);
++      if (key == "poll_e_worker") {
++        val = "true";
++      } else if (i + 1 < argc) {
++        val = argv[++i];
++      } else {
++        continue;
++      }
++    } else {
++      key = std::string(arg.substr(0, eq));
++      val = std::string(arg.substr(eq + 1));
+     }
+-    std::stringstream buffer;
+-    buffer << file.rdbuf();
+-    return buffer.str();
++
++    if (key == "backend") absl::SetFlag(&FLAGS_backend, val);
++    else if (key == "model_path") absl::SetFlag(&FLAGS_model_path, val);
++    else if (key == "input_prompt") absl::SetFlag(&FLAGS_input_prompt, val);
++    else if (key == "input_prompt_file") absl::SetFlag(&FLAGS_input_prompt_file, val);
++    else if (key == "litert_dispatch_lib_dir") absl::SetFlag(&FLAGS_litert_dispatch_lib_dir, val);
++    else if (key == "poll_e_worker") absl::SetFlag(&FLAGS_poll_e_worker, val != "false" && val != "0");
++    else if (key == "poll_e_profile_file") absl::SetFlag(&FLAGS_poll_e_profile_file, val);
++    else if (key == "poll_e_max_output_tokens") absl::SetFlag(&FLAGS_poll_e_max_output_tokens, std::stoi(val));
+   }
+-  // If no input prompt is provided, use the default prompt.
+-  return "What is the tallest building in the world?";
+ }
+ 
+ absl::Status MainHelper(int argc, char** argv) {
+-  absl::ParseCommandLine(argc, argv);
++  litert::lm::RegisterAdvancedEngine();
++  ParseManualFlags(argc, argv);
+   // Overrides the default for FLAGS_minloglevel to error.
+   absl::SetMinLogLevel(absl::LogSeverityAtLeast::kError);
+   absl::SetStderrThreshold(absl::LogSeverityAtLeast::kFatal);
+@@ -128,6 +244,12 @@ absl::Status MainHelper(int argc, char** argv) {
+   ASSIGN_OR_RETURN(
+       EngineSettings engine_settings,
+       EngineSettings::CreateDefault(std::move(model_assets), backend));
++  const std::string dispatch_lib_dir =
++      absl::GetFlag(FLAGS_litert_dispatch_lib_dir);
++  if (!dispatch_lib_dir.empty()) {
++    engine_settings.GetMutableMainExecutorSettings().SetLitertDispatchLibDir(
++        dispatch_lib_dir);
++  }
+   // Enable benchmark by default.
+   engine_settings.GetMutableBenchmarkParams() =
+       litert::lm::proto::BenchmarkParams();
+@@ -139,24 +261,36 @@ absl::Status MainHelper(int argc, char** argv) {
+   // Create the conversation.
+   std::unique_ptr<Conversation> conversation;
+   auto session_config = litert::lm::SessionConfig::CreateDefault();
++  auto conversation_config_builder = ConversationConfig::Builder();
++  conversation_config_builder.SetSessionConfig(session_config)
++      .SetEnableThinking(false);
++  const std::string profile_file = absl::GetFlag(FLAGS_poll_e_profile_file);
++  if (!profile_file.empty()) {
++    ASSIGN_OR_RETURN(const std::string profile_text, ReadTextFile(profile_file));
++    JsonPreface preface;
++    preface.messages = json::array({MakeTextMessage("system", profile_text)});
++    preface.tools = json::array();
++    preface.extra_context = json::object();
++    conversation_config_builder.SetPreface(preface)
++        .SetPrefillPrefaceOnInit(true);
++  }
+   ASSIGN_OR_RETURN(auto conversation_config,
+-                   ConversationConfig::Builder()
+-                       .SetSessionConfig(session_config)
+-                       .Build(*engine));
++                   conversation_config_builder.Build(*engine));
+   ASSIGN_OR_RETURN(conversation,
+                    Conversation::Create(*engine, conversation_config));
+ 
++  if (absl::GetFlag(FLAGS_poll_e_worker)) {
++    return RunPollEWorker(*engine, conversation_config);
++  }
++
+   // Prepare the message to send.
+-  json content_list = json::array();
+-  const std::string input_prompt = GetInputPrompt();
++  ASSIGN_OR_RETURN(const std::string input_prompt, GetInputPrompt());
+   std::cout << "input_prompt: " << input_prompt << std::endl;
+-  content_list.push_back({{"type", "text"}, {"text", input_prompt}});
+ 
+   // Send the message and wait for the response, asynchronously log the
+   // response.
+   RETURN_IF_ERROR(conversation->SendMessageAsync(
+-      json::object({{"role", "user"}, {"content", content_list}}),
+-      CreateMessageCallback()));
++      MakeTextMessage("user", input_prompt), CreateMessageCallback()));
+   RETURN_IF_ERROR(engine->WaitUntilDone(absl::Minutes(10)));
+ 
+   // Print the benchmark info.
+diff --git a/runtime/executor/llm_litert_npu_compiled_model_executor.cc b/runtime/executor/llm_litert_npu_compiled_model_executor.cc
+index 125c80fa..a0cf0667 100644
+--- a/runtime/executor/llm_litert_npu_compiled_model_executor.cc
++++ b/runtime/executor/llm_litert_npu_compiled_model_executor.cc
+@@ -458,8 +458,9 @@ LlmLiteRtNpuCompiledModelExecutor::CreateLiteRtNpuOptions(
+       ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::kBurst);
+   LITERT_ASSIGN_OR_RETURN(auto& google_tensor_opts,
+                           options.GetGoogleTensorOptions());
+-  google_tensor_opts.SetPerformanceMode(
+-      ::litert::google_tensor::GoogleTensorOptions::PerformanceMode::kBurst);
++  // SetPerformanceMode not available in pinned LiteRT (fb16353a)
++  // google_tensor_opts.SetPerformanceMode(
++  //     ::litert::google_tensor::GoogleTensorOptions::PerformanceMode::kBurst);
+ #endif
+   return options;
+ }
+@@ -813,15 +814,16 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::AllocateTransformerBuffers(
+       if (absl::StartsWith(output_name, kv_cache_slice_k_root_name) ||
+           absl::StartsWith(output_name, kv_cache_slice_v_root_name)) {
+         auto tensor_expected = prefill_signature->OutputTensor(output_name);
+-        if (tensor_expected.HasValue()) {
+-          HWQuantParams q_params;
+-          if (tensor_expected->HasQuantization()) {
+-            auto pq = tensor_expected->PerTensorQuantization();
+-            q_params.scale = pq.scale;
+-            q_params.zero_point = pq.zero_point;
++          if (tensor_expected.HasValue()) {
++            HWQuantParams q_params;
++            // HasQuantization/PerTensorQuantization not in pinned LiteRT
++            // if (tensor_expected->HasQuantization()) {
++            //   auto pq = tensor_expected->PerTensorQuantization();
++            //   q_params.scale = pq.scale;
++            //   q_params.zero_point = pq.zero_point;
++            // }
++            kv_quant_params[output_name] = q_params;
+           }
+-          kv_quant_params[output_name] = q_params;
+-        }
+       }
+     }
+   }
+@@ -2911,20 +2913,21 @@ LlmLiteRtNpuCompiledModelExecutor::Create(
+   LITERT_ASSIGN_OR_RETURN(
+       auto logits_tensor,
+       decode_signature.OutputTensor(LlmSignatures::kDecodeLogitsOutput));
+-  if (logits_tensor.HasQuantization()) {
+-    auto q_params = logits_tensor.PerTensorQuantization();
+-    quantization_params.scale = q_params.scale;
+-    quantization_params.zero_point = static_cast<int32_t>(q_params.zero_point);
+-    ABSL_LOG(INFO) << "Logits quantization params from '" << kDecodeSignature
+-                   << "' signature: scale=" << quantization_params.scale
+-                   << " zero_point=" << quantization_params.zero_point;
+-  } else {
+-    ABSL_LOG(WARNING) << "No quantization for logits in '" << kDecodeSignature
+-                      << "' signature (using default scale= "
++  // HasQuantization/PerTensorQuantization not available in pinned LiteRT (fb16353a)
++  // if (logits_tensor.HasQuantization()) {
++  //   auto q_params = logits_tensor.PerTensorQuantization();
++  //   quantization_params.scale = q_params.scale;
++  //   quantization_params.zero_point = static_cast<int32_t>(q_params.zero_point);
++  //   ABSL_LOG(INFO) << "Logits quantization params from '" << kDecodeSignature
++  //                  << "' signature: scale=" << quantization_params.scale
++  //                  << " zero_point=" << quantization_params.zero_point;
++  // } else {
++    ABSL_LOG(WARNING) << "Logits quantization detection not available in this "
++                         "LiteRT version (using default scale= "
+                       << quantization_params.scale
+                       << ", zero_point= " << quantization_params.zero_point
+                       << ").";
+-  }
++  // }
+   // For the lack of a better way to identify the model variants, we use the
+   // presence of per-layer embeddings as the signal for Gemma3n.
+   LITERT_ASSIGN_OR_RETURN(const bool has_per_layer_embeddings,
+@@ -3161,21 +3164,23 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelHasPerLayerEmbedding(
+         qp.scales = nullptr;
+         qp.is_per_channel = false;
+ 
+-        if (table_tensor.HasQuantization()) {
+-          auto q_type = table_tensor.QTypeId();
+-          if (q_type == kLiteRtQuantizationPerTensor) {
+-            // Single scale for the entire table.
+-            auto q_params = table_tensor.PerTensorQuantization();
+-            ple_per_tensor_scales.push_back(q_params.scale);
+-            qp.scales = &ple_per_tensor_scales.back();
+-          } else if (q_type == kLiteRtQuantizationPerChannel) {
+-            // Per-channel (per-row/per-token) quantization. Our model uses
+-            // this, meaning each token has its own dequantization scale.
+-            auto q_params = table_tensor.PerChannelQuantization();
+-            qp.scales = q_params.scales;
+-            qp.is_per_channel = true;
+-          }
+-        }
++        // HasQuantization/QTypeId/PerTensorQuantization/PerChannelQuantization
++        // not available in pinned LiteRT (fb16353a)
++        // if (table_tensor.HasQuantization()) {
++        //   auto q_type = table_tensor.QTypeId();
++        //   if (q_type == kLiteRtQuantizationPerTensor) {
++        //     // Single scale for the entire table.
++        //     auto q_params = table_tensor.PerTensorQuantization();
++        //     ple_per_tensor_scales.push_back(q_params.scale);
++        //     qp.scales = &ple_per_tensor_scales.back();
++        //   } else if (q_type == kLiteRtQuantizationPerChannel) {
++        //     // Per-channel (per-row/per-token) quantization. Our model uses
++        //     // this, meaning each token has its own dequantization scale.
++        //     auto q_params = table_tensor.PerChannelQuantization();
++        //     qp.scales = q_params.scales;
++        //     qp.is_per_channel = true;
++        //   }
++        // }
+         ple_quant_params.push_back(qp);
+         table_count++;
+       }
+@@ -3222,10 +3227,13 @@ LlmLiteRtNpuCompiledModelExecutor::CreateForModelHasPerLayerEmbedding(
+     // use them to quantize our dequantized floats back to Int16 before writing
+     // to NPU.
+     if (output_type == litert::ElementType::Int16) {
+-      RET_CHECK(output_tensor.HasQuantization());
+-      auto q_params = output_tensor.PerTensorQuantization();
+-      final_scale = q_params.scale;
+-      final_zero_point = q_params.zero_point;
++      // HasQuantization/PerTensorQuantization not in pinned LiteRT (fb16353a)
++      // RET_CHECK(output_tensor.HasQuantization());
++      // auto q_params = output_tensor.PerTensorQuantization();
++      // final_scale = q_params.scale;
++      // final_zero_point = q_params.zero_point;
++      ABSL_LOG(WARNING) << "Output quantization not available in this LiteRT "
++                           "version, using default scale/zero_point";
+     }
+   } else {
+     LITERT_ASSIGN_OR_RETURN(
+@@ -3513,4 +3521,68 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::ClearKVCache(
+   return absl::OkStatus();
+ }
+ 
++#if defined(LITERT_LM_ENABLE_INLINE_NPU_STUBS)
++// Stub implementations for NPU utility functions not available in the local
++// CMake branch build. Bazel builds the real implementations from
++// llm_litert_npu_compiled_model_executor_utils.cc.
++
++int FindMaxIndexSse2Float(const float* data, int size) {
++  if (size <= 0) return -1;
++  int max_idx = 0;
++  for (int i = 1; i < size; ++i) {
++    if (data[i] > data[max_idx]) max_idx = i;
++  }
++  return max_idx;
++}
++
++int FindMaxIndexSse2Int16(const int16_t* data, int size) {
++  if (size <= 0) return -1;
++  int max_idx = 0;
++  for (int i = 1; i < size; ++i) {
++    if (data[i] > data[max_idx]) max_idx = i;
++  }
++  return max_idx;
++}
++
++absl::Status HWPerLayerEmbeddingLookup(
++    const int* token_ids, int num_tokens, const uint8_t* const* table_ptrs,
++    const HWQuantizationParams* quant_params, int num_tables,
++    int ple_embedding_dim, void* output_buffer,
++    ElementType input_embedding_type, ElementType output_embedding_type,
++    float emb_scale, int num_threads) {
++  return absl::UnimplementedError(
++      "NPU hardware embedding not available in CPU build");
++}
++
++absl::Status HWMaskUpdate(
++    absl::flat_hash_map<absl::string_view, litert::TensorBuffer>& in_buffers,
++    absl::flat_hash_map<absl::string_view, litert::TensorBuffer>&
++        out_buffers) {
++  return absl::UnimplementedError(
++      "NPU mask update not available in CPU build");
++}
++
++absl::Status HWKVCacheUpdate(
++    absl::flat_hash_map<absl::string_view, litert::TensorBuffer>& in_buffers,
++    absl::flat_hash_map<absl::string_view, litert::TensorBuffer>& out_buffers,
++    const absl::flat_hash_map<absl::string_view, HWQuantParams>&
++        quant_params) {
++  return absl::UnimplementedError(
++      "NPU KV cache update not available in CPU build");
++}
++
++absl::Status DequantizeLogits(const litert::TensorBuffer& src,
++                              litert::TensorBuffer& dst, float scale,
++                              int32_t zero_point, bool should_dump) {
++  return absl::UnimplementedError(
++      "NPU logits dequantization not available in CPU build");
++}
++
++absl::StatusOr<int> ApplyGreedySampling(
++    litert::TensorBuffer& decoded_logits, bool use_neon_sampling) {
++  return absl::UnimplementedError(
++      "NPU greedy sampling not available in CPU build");
++}
++#endif  // defined(LITERT_LM_ENABLE_INLINE_NPU_STUBS)
++
+ }  // namespace litert::lm

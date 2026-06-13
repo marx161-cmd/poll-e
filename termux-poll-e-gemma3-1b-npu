@@ -1,0 +1,11 @@
+#!/system/bin/sh
+PROMPT="$*"
+if [ -z "$PROMPT" ]; then
+  PROMPT="What is 2+2?"
+fi
+
+export LD_LIBRARY_PATH=/data/local/tmp/litertlm-test
+exec /data/local/tmp/litertlm-test/litert_lm_main \
+  --backend=npu \
+  --model_path=/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm \
+  --input_prompt="$PROMPT"

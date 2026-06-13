@@ -1,0 +1,25 @@
+# Large local recovery/build state
+recovery-*/
+runtime-backup-*/
+
+# LiteRT/Bazel generated links or outputs if a working tree is copied here
+bazel-*
+bazel-bin/
+bazel-out/
+bazel-testlogs/
+
+# Model/runtime blobs
+*.litertlm
+*.gguf
+*.tflite
+*.onnx
+*.bin
+*.so
+*.tar
+*.zip
+
+# Local scratch/logs
+*.log
+*.err
+*.tmp
+.DS_Store
