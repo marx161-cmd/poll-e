@@ -2,6 +2,8 @@ package com.termux.suggest
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.File
@@ -26,6 +28,7 @@ class WorkerConnection {
     private var process: Process? = null
     private var writer: PrintWriter? = null
     private var reader: BufferedReader? = null
+    private val requestMutex = Mutex()
 
     @Volatile var isReady = false
         private set
@@ -73,31 +76,33 @@ class WorkerConnection {
         }
     }
 
-    suspend fun request(snapshot: String): String? = withContext(Dispatchers.IO) {
-        if (!isReady || process?.isAlive != true) {
-            Log.w(TAG, "Worker not ready, dropping snapshot")
-            return@withContext null
-        }
-        try {
-            writer!!.println(snapshot)
-            writer!!.flush()
-
-            val sb = StringBuilder()
-            var inBlock = false
-            var line: String?
-            while (reader!!.readLine().also { line = it } != null) {
-                when {
-                    line!!.contains("POLL_E_BEGIN") -> { inBlock = true; sb.clear() }
-                    line!!.contains("POLL_E_END") && inBlock -> return@withContext sb.toString().trim()
-                    inBlock -> { if (sb.isNotEmpty()) sb.append('\n'); sb.append(line) }
-                }
+    suspend fun request(snapshot: String): String? = requestMutex.withLock {
+        withContext(Dispatchers.IO) {
+            if (!isReady || process?.isAlive != true) {
+                Log.w(TAG, "Worker not ready, dropping snapshot")
+                return@withContext null
             }
-            Log.w(TAG, "Stdout closed before POLL_E_END")
-            null
-        } catch (e: Exception) {
-            Log.e(TAG, "Request failed", e)
-            isReady = false
-            null
+            try {
+                writer!!.println(snapshot.take(MAX_SNAPSHOT_CHARS))
+                writer!!.flush()
+
+                val sb = StringBuilder()
+                var inBlock = false
+                var line: String?
+                while (reader!!.readLine().also { line = it } != null) {
+                    when {
+                        line!!.contains("POLL_E_BEGIN") -> { inBlock = true; sb.clear() }
+                        line!!.contains("POLL_E_END") && inBlock -> return@withContext sb.toString().trim()
+                        inBlock -> { if (sb.isNotEmpty()) sb.append('\n'); sb.append(line) }
+                    }
+                }
+                Log.w(TAG, "Stdout closed before POLL_E_END")
+                null
+            } catch (e: Exception) {
+                Log.e(TAG, "Request failed", e)
+                isReady = false
+                null
+            }
         }
     }
 
@@ -124,5 +129,6 @@ class WorkerConnection {
         private const val BINARY = "/data/local/tmp/poll-e-worker-test/litert_lm_main"
         private const val MODEL_PATH = "/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm"
         private const val MAX_TOKENS = 48
+        private const val MAX_SNAPSHOT_CHARS = 5_000
     }
 }

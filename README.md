@@ -6,8 +6,8 @@ Poll-E is an experimental on-device ambient suggestion daemon for a rooted Pixel
 | Component | Status | Package |
 |-----------|--------|---------|
 | LiteRT-LM worker | **Working** | native binary, `com.termux.*` Termux |
-| AccessibilityService APK | **Skeleton (builds)** | `com.termux.suggest` |
-| PixelXpert fork with slot | Planned | `com.termux.*` |
+| AccessibilityService APK | **Installed prototype** | `com.termux.suggest` |
+| PixelXpert fork with slot | **Installed prototype** | `sh.siava.pixelxpert` |
 
 The repository is source-first. Large local recovery trees, model files, and
 runtime binaries are intentionally not committed.
@@ -19,8 +19,11 @@ runtime binaries are intentionally not committed.
 - **Runtime:** LiteRT-LM built with Bazel and Android NDK r29, running on NPU.
 - **Worker confirmed generating suggestions:** `POLL_E_BEGIN / Want to meet at 7 / POLL_E_END`
   for a Messages context. Prompt: direct completion framing (not role-playing).
-- **AccessibilityService APK skeleton:** compiles and builds; wires accessibility
-  tree walk → debounce/dedup → worker IPC → broadcast. No PixelXpert IPC yet.
+- **AccessibilityService APK prototype:** installed and enabled; wires
+  accessibility tree walk → debounce/dedup → single-flight worker IPC →
+  signature-protected broadcast.
+- **PixelXpert slot prototype:** installed; receives signed Poll-E broadcasts
+  and displays the suggestion in the status bar. Accept/insert is still TODO.
 
 ## Architecture
 
@@ -30,12 +33,24 @@ context change
   → debounce 300 ms
   → accessibility tree-walk → flatten to snapshot string
   → dedup hash  ── identical? ──> skip
+  → single-flight request gate  ── busy? ──> keep latest snapshot only
   → litert_lm_main (stdin/stdout via su, NPU)
   → POLL_E_BEGIN / suggestion text / POLL_E_END
   → output gate (NONE? skip. blank? skip.)
-  → ACTION_SUGGESTION broadcast  [→ PixelXpert slot, TODO]
+  → ACTION_SUGGESTION broadcast with signature permission
+  → PixelXpert status-bar slot
   → vol-up: accept / vol-down: dismiss  [TODO]
 ```
+
+Measured resident-worker request latency on the Pixel:
+
+- low context, ~65 chars: `0.40-0.55s`
+- mid context, ~2k chars: `1.31-1.49s`
+- high valid context, ~5k chars: `1.65-1.68s`
+
+The Gemma 3 1B Tensor G5 package has a 1280-token context limit. The APK caps
+snapshots at 5000 chars before writing to the worker to avoid killing the native
+process with an overlong request.
 
 ## Worker Protocol
 

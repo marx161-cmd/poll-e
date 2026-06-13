@@ -30,6 +30,9 @@ class PollEAccessibilityService : AccessibilityService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val worker = WorkerConnection()
     private var debounceJob: Job? = null
+    private var requestJob: Job? = null
+    private var pendingSnapshot: String? = null
+    private val requestLock = Any()
     private var lastSnapshotHash = 0
 
     override fun onServiceConnected() {
@@ -60,8 +63,35 @@ class PollEAccessibilityService : AccessibilityService() {
             lastSnapshotHash = hash
 
             Log.d(TAG, "Snapshot: ${snapshot.take(120)}…")
-            val suggestion = worker.request(snapshot) ?: return@launch
-            onSuggestion(suggestion)
+            enqueueSnapshot(snapshot)
+        }
+    }
+
+    private fun enqueueSnapshot(snapshot: String) {
+        synchronized(requestLock) {
+            if (requestJob?.isActive == true) {
+                pendingSnapshot = snapshot
+                Log.d(TAG, "Worker busy; keeping latest pending snapshot")
+                return
+            }
+
+            requestJob = scope.launch {
+                var current = snapshot
+                while (true) {
+                    val suggestion = worker.request(current)
+                    if (suggestion != null) onSuggestion(suggestion)
+
+                    synchronized(requestLock) {
+                        val next = pendingSnapshot
+                        pendingSnapshot = null
+                        if (next == null) {
+                            requestJob = null
+                            return@launch
+                        }
+                        current = next
+                    }
+                }
+            }
         }
     }
 
