@@ -39,7 +39,7 @@ context change
   → output gate (NONE? skip. blank? skip.)
   → ACTION_SUGGESTION broadcast with signature permission
   → PixelXpert status-bar slot
-  → vol-up: accept / vol-down: dismiss  [TODO]
+  → volume-down: accept/insert through Poll-E accessibility service
 ```
 
 Measured resident-worker request latency on the Pixel:
