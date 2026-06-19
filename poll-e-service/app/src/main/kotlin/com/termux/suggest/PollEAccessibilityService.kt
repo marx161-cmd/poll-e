@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Bundle
 import android.util.Log
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.CoroutineScope
@@ -41,21 +42,59 @@ class PollEAccessibilityService : AccessibilityService() {
     private var lastSnapshotHash = 0
     private var lastSuggestion: String? = null
 
-    private val acceptReceiver = object : BroadcastReceiver() {
+    private val actionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != ACTION_ACCEPT) return
-            val text = intent.getStringExtra(EXTRA_TEXT) ?: lastSuggestion ?: return
-            acceptSuggestion(text)
+            when (intent.action) {
+                ACTION_ACCEPT -> {
+                    val text = intent.getStringExtra(EXTRA_TEXT) ?: lastSuggestion ?: return
+                    acceptSuggestion(text)
+                    SuggestionNotifier.clear(context)
+                    lastSuggestion = null
+                }
+                ACTION_DISMISS -> {
+                    SuggestionNotifier.clear(context)
+                    lastSuggestion = null
+                }
+            }
+        }
+    }
+
+    private val automationReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                ACTION_ACCEPT_PUBLIC -> {
+                    val text = intent.getStringExtra(EXTRA_TEXT) ?: lastSuggestion ?: return
+                    acceptSuggestion(text)
+                    SuggestionNotifier.clear(context)
+                    lastSuggestion = null
+                }
+                ACTION_DISMISS_PUBLIC -> {
+                    SuggestionNotifier.clear(context)
+                    lastSuggestion = null
+                }
+            }
         }
     }
 
     override fun onServiceConnected() {
         Log.i(TAG, "Service connected — starting worker")
+        SuggestionNotifier.init(this)
         registerReceiver(
-            acceptReceiver,
-            IntentFilter(ACTION_ACCEPT),
+            actionReceiver,
+            IntentFilter().apply {
+                addAction(ACTION_ACCEPT)
+                addAction(ACTION_DISMISS)
+            },
             PERMISSION_POLL_E_IPC,
             null,
+            RECEIVER_EXPORTED
+        )
+        registerReceiver(
+            automationReceiver,
+            IntentFilter().apply {
+                addAction(ACTION_ACCEPT_PUBLIC)
+                addAction(ACTION_DISMISS_PUBLIC)
+            },
             RECEIVER_EXPORTED
         )
         scope.launch { worker.start() }
@@ -123,12 +162,17 @@ class PollEAccessibilityService : AccessibilityService() {
         }
         lastSuggestion = text
         Log.i(TAG, "Suggestion: $text")
+        SuggestionNotifier.post(this, text)
+    }
 
-        // Send to PixelXpert's SystemUI hook. Permission enforces only same-signed apps receive it.
-        sendBroadcast(
-            Intent(ACTION_SUGGESTION).apply { putExtra(EXTRA_TEXT, text) },
-            PERMISSION_POLL_E_IPC
-        )
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        val suggestion = lastSuggestion ?: return false
+        if (event.keyCode != KeyEvent.KEYCODE_VOLUME_DOWN) return false
+        if (event.action != KeyEvent.ACTION_UP) return false
+        acceptSuggestion(suggestion)
+        SuggestionNotifier.clear(this)
+        lastSuggestion = null
+        return true
     }
 
     private fun acceptSuggestion(text: String) {
@@ -188,7 +232,9 @@ class PollEAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
-        runCatching { unregisterReceiver(acceptReceiver) }
+        runCatching { unregisterReceiver(actionReceiver) }
+        runCatching { unregisterReceiver(automationReceiver) }
+        SuggestionNotifier.clear(this)
         scope.cancel()
         worker.stop()
         super.onDestroy()
@@ -200,6 +246,9 @@ class PollEAccessibilityService : AccessibilityService() {
 
         const val ACTION_SUGGESTION = "com.termux.suggest.SUGGESTION"
         const val ACTION_ACCEPT = "com.termux.suggest.ACCEPT"
+        const val ACTION_DISMISS = "com.termux.suggest.DISMISS"
+        const val ACTION_ACCEPT_PUBLIC = "com.termux.suggest.ACCEPT_PUBLIC"
+        const val ACTION_DISMISS_PUBLIC = "com.termux.suggest.DISMISS_PUBLIC"
         const val EXTRA_TEXT = "text"
         const val PERMISSION_POLL_E_IPC = "com.termux.suggest.permission.POLL_E_IPC"
     }

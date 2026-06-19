@@ -6,6 +6,8 @@
         android:name="com.termux.suggest.permission.POLL_E_IPC"
         android:protectionLevel="signature" />
     <uses-permission android:name="com.termux.suggest.permission.POLL_E_IPC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <application
         android:label="Poll-E"

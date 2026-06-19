@@ -119,6 +119,32 @@ works across components.
 **Root access required:** grant `com.termux.suggest` root in APatch settings
 before enabling the accessibility service.
 
+## Accept / Restart From Key Mapper
+
+The service accepts suggestions either from its notification action, from
+`VolumeDown` when the accessibility service receives key events, or from a
+public automation broadcast intended for local root tools.
+
+Installed phone-side scripts:
+
+```bash
+/data/data/com.termux/files/home/.termux/tasker/polle_accept.sh
+/data/data/com.termux/files/home/.termux/tasker/polle_dismiss.sh
+/data/data/com.termux/files/home/.termux/tasker/polle_restart.sh
+```
+
+Recommended Key Mapper action for accepting the current suggestion:
+
+```bash
+/data/data/com.termux/files/home/.termux/tasker/polle_accept.sh
+```
+
+Run it as root in Key Mapper. Restart the Poll-E accessibility service with:
+
+```bash
+/data/data/com.termux/files/home/.termux/tasker/polle_restart.sh
+```
+
 ## Recreate Worker
 
 See `RECREATE.md`.
