@@ -108,6 +108,8 @@ index 6dae7590..8c01ad61 100644
 +absl::Status RunPollEWorker(litert::lm::Engine& engine,
 +                            const ConversationConfig& conversation_config) {
 +  const int max_output_tokens = absl::GetFlag(FLAGS_poll_e_max_output_tokens);
++  ASSIGN_OR_RETURN(std::unique_ptr<Conversation> base_conversation,
++                   Conversation::Create(engine, conversation_config));
 +  std::cout << "POLL_E_READY" << std::endl;
 +
 +  std::string snapshot;
@@ -121,13 +123,17 @@ index 6dae7590..8c01ad61 100644
 +    OptionalArgs optional_args;
 +    optional_args.max_output_tokens = max_output_tokens;
 +    optional_args.enable_thinking = false;
++
++    absl::Time start = absl::Now();
 +    ASSIGN_OR_RETURN(std::unique_ptr<Conversation> request_conversation,
-+                     Conversation::Create(engine, conversation_config));
++                     base_conversation->Clone());
 +    ASSIGN_OR_RETURN(
 +        Message response,
 +        request_conversation->SendMessage(
 +            MakeTextMessage("user", BuildPollEPrompt(snapshot)),
 +            std::move(optional_args)));
++    std::cerr << "Poll-E request_ms="
++              << absl::ToInt64Milliseconds(absl::Now() - start) << std::endl;
 +    std::cout << "POLL_E_BEGIN\n"
 +              << ExtractMessageText(response)
 +              << "\nPOLL_E_END" << std::endl;
