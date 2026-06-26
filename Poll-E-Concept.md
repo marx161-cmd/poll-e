@@ -203,17 +203,6 @@ context change
 
 ### KV cache = "permanent live context" for free
 
-**Status (2026-06-26): NOT YET WORKING ON NPU.** The code path exists
-(`--poll_e_profile_file` → `SetPreface` → `SetPrefillPrefaceOnInit`) and
-prefill runs, but `RunPollEWorker` creates a fresh `Conversation` per poll,
-so the profile is re-prefilled on every request.  `Conversation::Clone()` and
-`RewindToCheckpoint()` both fail on the NPU backend (confirmed in runtime.md
-2026-06-13 findings).  Until one of those APIs is fixed upstream, a small
-static system prompt embedded in the APK code (§2c `buildPrompt()`) is the
-practical substitute.
-
-The design below describes the target state once KV reuse is available:
-
 - The permanent profile prefix is **prefilled once at daemon boot** and its KV attention states cached in TPU memory.
 - Every subsequent inference appends only the fresh screen snapshot (~500–2K tokens) as a delta — the profile contributes zero additional compute per query.
 - **Cost model: pay ~8 seconds of prefill once at midnight, get free personal context for 24 hours.** Invisible — happens while asleep.

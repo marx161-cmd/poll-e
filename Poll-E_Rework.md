@@ -34,10 +34,9 @@ it — don't re-spend effort there.
   Headroom is generous for tool-call style prompts; the system prompt now
   saturates ~1500 tokens with role, strategy, and examples.
 - Precaching/priming (clone or save-restore of a primed conversation) is
-  confirmed working on this NPU package in the *engine layer*, but
-  `Conversation::Clone()` and `RewindToCheckpoint()` both fail at the NPU
-  executor level, so true single-prefill KV reuse is blocked pending an
-  upstream LiteRT-LM fix.
+  confirmed working on this NPU package. Useful for any tool/mode that wants
+  a warm static system prompt, just not as a vehicle for shoving a whole
+  device snapshot in.
 
 **New:** Gemma's job changes from *generate the right text* to *pick the
 right tool, from a small fixed set, and pass it simple arguments*. That's a

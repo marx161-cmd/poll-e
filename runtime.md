@@ -145,8 +145,8 @@ APatch's `package_config` allowlist.
 Poll-E query: "where is the litert binary"
 → 10-round shell loop completed
 → Answer delivered to clipboard + notification
-→ Per-round latency: ~2000–3200 ms (cold prefill per round since KV reuse not
-  available on NPU)
+→ Per-round latency: ~2000–3200 ms (cold prefill per round with fresh
+  Conversation; KV reuse via Clone available in current build — see below)
 → Gemma 3 1B + EmbeddingGemma 300M both resident on NPU simultaneously
 ```
 
@@ -178,14 +178,10 @@ Patch behavior:
 - Worker protocol is `POLL_E_READY`, then `POLL_E_BEGIN` / `POLL_E_END` blocks.
   Native dispatch may print one startup line before `POLL_E_READY`; callers
   should ignore output until ready.
-- The current Tensor G5 NPU executor does not support true reusable-prefix KV
-  restoration through public LiteRT-LM APIs. `RewindToCheckpoint()` fails with
-  `NPU executor's SetCurrentStep only supports rolling back one token at the end
-  of decode`, and `Conversation::Clone()` fails with `GetRuntimeConfig not
-  implemented for backend: LiteRT NPU Compiled Model`.
-- The working fallback keeps the engine/model loaded but creates a fresh
-  conversation/session for each poll. That prevents history growth and keeps
-  behavior correct, but it re-prefills the profile baseline per poll.
+- Uses `Conversation::Clone()` to fork the primed conversation per poll:
+  profile is prefilled once at startup; each poll clones the primed
+  conversation (KV cache included), appends the snapshot as a user turn,
+  decodes, then discards the clone.  Single prefill cost per daemon lifetime.
 
 Staged phone copy:
 
