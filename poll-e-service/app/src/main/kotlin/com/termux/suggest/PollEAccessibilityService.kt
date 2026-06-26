@@ -5,235 +5,68 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.os.Bundle
 import android.util.Log
-import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Poll-E AccessibilityService — the sensor layer.
+ * Poll-E v2 AccessibilityService.
  *
- * Lifecycle:
- *   onServiceConnected → spawn worker → wait for POLL_E_READY
- *   onAccessibilityEvent (doorbell) → debounce 300 ms → tree-walk → dedup hash
- *     → [worker].request(snapshot) → onSuggestion(text)
- *
- * Output (skeleton): broadcasts ACTION_SUGGESTION with EXTRA_TEXT.
- * Production IPC to PixelXpert fork is a TODO (signature-protected content provider).
- *
- * The worker binary needs root. Grant this APK root access in APatch before use.
+ * Stays resident so findFocus() works on-demand. The only active trigger is
+ * ACTION_QUERY (sent by Keymapper on vol-down hold): reads the focused text
+ * field as a query and dispatches through QueryDispatcher's shell loop.
  */
 class PollEAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val worker = WorkerConnection()
-    private var debounceJob: Job? = null
-    private var requestJob: Job? = null
-    private var pendingSnapshot: String? = null
-    private val requestLock = Any()
-    private var lastSnapshotHash = 0
-    private var lastSuggestion: String? = null
+    private lateinit var worker: WorkerConnection
+    private lateinit var dispatcher: QueryDispatcher
 
-    private val actionReceiver = object : BroadcastReceiver() {
+    private val queryReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                ACTION_ACCEPT -> {
-                    val text = intent.getStringExtra(EXTRA_TEXT) ?: lastSuggestion ?: return
-                    acceptSuggestion(text)
-                    SuggestionNotifier.clear(context)
-                    lastSuggestion = null
-                }
-                ACTION_DISMISS -> {
-                    SuggestionNotifier.clear(context)
-                    lastSuggestion = null
-                }
+            if (intent.action != ACTION_QUERY) return
+            val query = readQueryFromFocusedField() ?: run {
+                Log.d(TAG, "ACTION_QUERY: no focused input field")
+                return
             }
-        }
-    }
-
-    private val automationReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                ACTION_ACCEPT_PUBLIC -> {
-                    val text = intent.getStringExtra(EXTRA_TEXT) ?: lastSuggestion ?: return
-                    acceptSuggestion(text)
-                    SuggestionNotifier.clear(context)
-                    lastSuggestion = null
-                }
-                ACTION_DISMISS_PUBLIC -> {
-                    SuggestionNotifier.clear(context)
-                    lastSuggestion = null
-                }
+            if (query.isBlank()) {
+                Log.d(TAG, "ACTION_QUERY: focused field is empty")
+                return
             }
+            Log.i(TAG, "Mode B query: ${query.take(100)}")
+            scope.launch { dispatcher.handleQuery(query) }
         }
     }
 
     override fun onServiceConnected() {
-        Log.i(TAG, "Service connected — starting worker")
+        worker = WorkerConnection(this)
         SuggestionNotifier.init(this)
-        registerReceiver(
-            actionReceiver,
-            IntentFilter().apply {
-                addAction(ACTION_ACCEPT)
-                addAction(ACTION_DISMISS)
-            },
-            PERMISSION_POLL_E_IPC,
-            null,
-            RECEIVER_EXPORTED
-        )
-        registerReceiver(
-            automationReceiver,
-            IntentFilter().apply {
-                addAction(ACTION_ACCEPT_PUBLIC)
-                addAction(ACTION_DISMISS_PUBLIC)
-            },
-            RECEIVER_EXPORTED
-        )
+        dispatcher = QueryDispatcher(worker, this)
+        registerReceiver(queryReceiver, IntentFilter(ACTION_QUERY), RECEIVER_EXPORTED)
         scope.launch { worker.start() }
+        Log.i(TAG, "Service connected")
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_FOCUSED,
-            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> scheduleSnapshot()
-        }
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent) = Unit
 
-    private fun scheduleSnapshot() {
-        debounceJob?.cancel()
-        debounceJob = scope.launch {
-            delay(DEBOUNCE_MS)
-            val root = rootInActiveWindow ?: return@launch
-            val snapshot = try {
-                SnapshotBuilder.build(this@PollEAccessibilityService, root)
-            } finally {
-                root.recycle()
-            }
-            val hash = snapshot.hashCode()
-            if (hash == lastSnapshotHash) return@launch
-            lastSnapshotHash = hash
-
-            Log.d(TAG, "Snapshot: ${snapshot.take(120)}…")
-            enqueueSnapshot(snapshot)
-        }
-    }
-
-    private fun enqueueSnapshot(snapshot: String) {
-        synchronized(requestLock) {
-            if (requestJob?.isActive == true) {
-                pendingSnapshot = snapshot
-                Log.d(TAG, "Worker busy; keeping latest pending snapshot")
-                return
-            }
-
-            requestJob = scope.launch {
-                var current = snapshot
-                while (true) {
-                    val suggestion = worker.request(current)
-                    if (suggestion != null) onSuggestion(suggestion)
-
-                    synchronized(requestLock) {
-                        val next = pendingSnapshot
-                        pendingSnapshot = null
-                        if (next == null) {
-                            requestJob = null
-                            return@launch
-                        }
-                        current = next
-                    }
-                }
-            }
-        }
-    }
-
-    private fun onSuggestion(text: String) {
-        if (text == "NONE" || text.isBlank()) {
-            Log.d(TAG, "Gate: NONE")
-            return
-        }
-        lastSuggestion = text
-        Log.i(TAG, "Suggestion: $text")
-        SuggestionNotifier.post(this, text)
-    }
-
-    override fun onKeyEvent(event: KeyEvent): Boolean {
-        val suggestion = lastSuggestion ?: return false
-        if (event.keyCode != KeyEvent.KEYCODE_VOLUME_DOWN) return false
-        if (event.action != KeyEvent.ACTION_UP) return false
-        acceptSuggestion(suggestion)
-        SuggestionNotifier.clear(this)
-        lastSuggestion = null
-        return true
-    }
-
-    private fun acceptSuggestion(text: String) {
-        val root = rootInActiveWindow ?: run {
-            Log.w(TAG, "Accept requested but no active window root is available")
-            return
-        }
-        try {
-            val focused = findFocusedEditable(root) ?: run {
-                Log.w(TAG, "Accept requested but no focused editable field was found")
-                return
-            }
-            try {
-                val currentText = focused.text?.toString().orEmpty()
-                val nextText = mergeSuggestion(currentText, text)
-                val args = Bundle().apply {
-                    putCharSequence(
-                        AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                        nextText
-                    )
-                }
-                if (focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-                    Log.i(TAG, "Accepted suggestion")
-                    lastSuggestion = null
-                } else {
-                    Log.w(TAG, "ACTION_SET_TEXT failed")
-                }
-            } finally {
-                focused.recycle()
-            }
+    private fun readQueryFromFocusedField(): String? {
+        val node = findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return null
+        return try {
+            node.text?.toString()?.takeIf { it.isNotBlank() }
         } finally {
-            root.recycle()
+            node.recycle()
         }
     }
 
-    private fun mergeSuggestion(currentText: String, suggestion: String): String {
-        if (currentText.isBlank()) return suggestion
-        if (suggestion.startsWith(currentText)) return suggestion
-        return "$currentText $suggestion"
-    }
-
-    private fun findFocusedEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        if (node.isEditable && (node.isFocused || node.isAccessibilityFocused)) {
-            return AccessibilityNodeInfo.obtain(node)
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            val result = findFocusedEditable(child)
-            child.recycle()
-            if (result != null) return result
-        }
-        return null
-    }
-
-    override fun onInterrupt() {
-        Log.w(TAG, "Interrupted")
-    }
+    override fun onInterrupt() = Unit
 
     override fun onDestroy() {
-        runCatching { unregisterReceiver(actionReceiver) }
-        runCatching { unregisterReceiver(automationReceiver) }
+        runCatching { unregisterReceiver(queryReceiver) }
         SuggestionNotifier.clear(this)
         scope.cancel()
         worker.stop()
@@ -242,14 +75,6 @@ class PollEAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "PollE"
-        private const val DEBOUNCE_MS = 300L
-
-        const val ACTION_SUGGESTION = "com.termux.suggest.SUGGESTION"
-        const val ACTION_ACCEPT = "com.termux.suggest.ACCEPT"
-        const val ACTION_DISMISS = "com.termux.suggest.DISMISS"
-        const val ACTION_ACCEPT_PUBLIC = "com.termux.suggest.ACCEPT_PUBLIC"
-        const val ACTION_DISMISS_PUBLIC = "com.termux.suggest.DISMISS_PUBLIC"
-        const val EXTRA_TEXT = "text"
-        const val PERMISSION_POLL_E_IPC = "com.termux.suggest.permission.POLL_E_IPC"
+        const val ACTION_QUERY = "com.termux.suggest.QUERY"
     }
 }

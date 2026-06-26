@@ -1,29 +1,31 @@
 package com.termux.suggest
 
+import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
 import java.io.PrintWriter
 
 /**
- * Manages the lifecycle of the native litert_lm_main worker process and the
- * line-based stdin/stdout protocol it speaks.
+ * Manages the lifecycle of the native litert_lm_main worker process.
  *
- * Startup: spawns `su -c "LD_LIBRARY_PATH=... litert_lm_main --poll_e_worker ..."`
- * and blocks until "POLL_E_READY" appears on stdout.
+ * Protocol: write one encoded prompt line to stdin; read until POLL_E_END.
+ * Newlines in prompts are encoded as literal \n before sending, decoded by
+ * BuildPollEPrompt on the binary side.
  *
- * Per request: writes one snapshot line to stdin, reads until "POLL_E_END".
- *
- * The caller is responsible for calling [start] once and [stop] on teardown.
- * If the process dies mid-session [request] returns null; the caller should
- * drop that snapshot and let the next accessibility event trigger a new attempt.
+ * The worker binary and NPU dispatch libraries are packaged as jniLibs and
+ * extracted to the app's nativeLibraryDir by the package manager.  This keeps
+ * execution in the app's own SELinux/linker namespace (same approach PhoneRAG
+ * uses for EmbeddingGemma).
  */
-class WorkerConnection {
+class WorkerConnection(private val context: Context) {
 
     private var process: Process? = null
     private var writer: PrintWriter? = null
@@ -35,20 +37,22 @@ class WorkerConnection {
 
     suspend fun start() = withContext(Dispatchers.IO) {
         try {
-            val su = resolveSu()
-            val cmd = "$su -c " +
-                "\"LD_LIBRARY_PATH=$LIB_DIR $BINARY" +
-                " --backend=npu" +
-                " --model_path=$MODEL_PATH" +
-                " --poll_e_worker" +
-                " --poll_e_max_output_tokens=$MAX_TOKENS\""
+            val nativeLibDir = context.applicationInfo.nativeLibraryDir
+            val binary = "$nativeLibDir/libpoll_e_worker.so"
 
-            Log.i(TAG, "Spawning: $cmd")
-            process = ProcessBuilder("sh", "-c", cmd)
-                .redirectErrorStream(false)
-                .start()
+            Log.i(TAG, "Spawning worker from $binary")
+            val pb = ProcessBuilder(
+                binary,
+                "--backend=npu",
+                "--litert_dispatch_lib_dir=$nativeLibDir",
+                "--model_path=$MODEL_PATH",
+                "--poll_e_worker",
+                "--poll_e_max_output_tokens=$MAX_TOKENS"
+            )
+            pb.environment()["LD_LIBRARY_PATH"] = "$nativeLibDir:/vendor/lib64"
+            pb.redirectErrorStream(false)
+            process = pb.start()
 
-            // Drain stderr to logcat so it doesn't block the pipe.
             val errStream = process!!.errorStream
             Thread {
                 BufferedReader(InputStreamReader(errStream)).forEachLine { line ->
@@ -59,8 +63,6 @@ class WorkerConnection {
             writer = PrintWriter(process!!.outputStream.bufferedWriter())
             reader = BufferedReader(InputStreamReader(process!!.inputStream))
 
-            // Block until POLL_E_READY (contains check handles the
-            // "SouthBound...POLL_E_READY" merged line from libedgetpu).
             var line: String?
             while (reader!!.readLine().also { line = it } != null) {
                 Log.d(TAG, "startup: $line")
@@ -76,28 +78,36 @@ class WorkerConnection {
         }
     }
 
-    suspend fun request(snapshot: String): String? = requestMutex.withLock {
+    suspend fun request(prompt: String, timeoutMs: Long = 15_000L): String? = requestMutex.withLock {
         withContext(Dispatchers.IO) {
             if (!isReady || process?.isAlive != true) {
-                Log.w(TAG, "Worker not ready, dropping snapshot")
+                Log.w(TAG, "Worker not ready")
                 return@withContext null
             }
             try {
-                writer!!.println(snapshot.take(MAX_SNAPSHOT_CHARS))
+                val encoded = prompt.take(MAX_PROMPT_CHARS).replace("\n", "\\n")
+                writer!!.println(encoded)
                 writer!!.flush()
 
-                val sb = StringBuilder()
-                var inBlock = false
-                var line: String?
-                while (reader!!.readLine().also { line = it } != null) {
-                    when {
-                        line!!.contains("POLL_E_BEGIN") -> { inBlock = true; sb.clear() }
-                        line!!.contains("POLL_E_END") && inBlock -> return@withContext sb.toString().trim()
-                        inBlock -> { if (sb.isNotEmpty()) sb.append('\n'); sb.append(line) }
+                try {
+                    withTimeout(timeoutMs) {
+                        val sb = StringBuilder()
+                        var inBlock = false
+                        var line: String?
+                        while (reader!!.readLine().also { line = it } != null) {
+                            when {
+                                line!!.contains("POLL_E_BEGIN") -> { inBlock = true; sb.clear() }
+                                line!!.contains("POLL_E_END") && inBlock -> return@withTimeout sb.toString().trim()
+                                inBlock -> { if (sb.isNotEmpty()) sb.append('\n'); sb.append(line) }
+                            }
+                        }
+                        Log.w(TAG, "Stdout closed before POLL_E_END")
+                        null
                     }
+                } catch (_: TimeoutCancellationException) {
+                    Log.e(TAG, "Request timed out after ${timeoutMs}ms")
+                    null
                 }
-                Log.w(TAG, "Stdout closed before POLL_E_END")
-                null
             } catch (e: Exception) {
                 Log.e(TAG, "Request failed", e)
                 isReady = false
@@ -114,21 +124,12 @@ class WorkerConnection {
         process = null
     }
 
-    private fun resolveSu(): String = listOf(
-        "/system/bin/su",
-        "/system/xbin/su",
-        "/sbin/su"
-    ).firstOrNull { File(it).exists() } ?: "su"
-
     companion object {
         private const val TAG = "PollE/Worker"
         private const val TAG_ERR = "PollE/Worker-err"
 
-        // Paths on device — adjust if staged elsewhere.
-        private const val LIB_DIR = "/data/local/tmp/poll-e-worker-test"
-        private const val BINARY = "/data/local/tmp/poll-e-worker-test/litert_lm_main"
         private const val MODEL_PATH = "/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm"
-        private const val MAX_TOKENS = 48
-        private const val MAX_SNAPSHOT_CHARS = 5_000
+        private const val MAX_TOKENS = 200
+        private const val MAX_PROMPT_CHARS = 10_000
     }
 }

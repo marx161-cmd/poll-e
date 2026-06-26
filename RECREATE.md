@@ -3,7 +3,7 @@
 These notes recreate the current source state without relying on the local
 2 GB recovery tree being present in this repository.
 
-## 1. Prepare LiteRT-LM
+## 1. Prepare LiteRT-LM (worker binary)
 
 Use the preserved working copy if available:
 
@@ -25,7 +25,7 @@ working copy. If upstream moved, apply manually around
 `runtime/engine/litert_lm_main.cc` and the NPU stub guard in
 `runtime/executor/llm_litert_npu_compiled_model_executor.cc`.
 
-## 2. Build
+## 2. Build worker binary
 
 Use Bazel, not the standalone CMake recipe.
 
@@ -37,15 +37,45 @@ bazelisk build --config=android_arm64 //runtime/engine:litert_lm_main
 NDK r26d failed in the Rust `cxx`/libc++ path on this machine. NDK r29 built the
 current worker successfully.
 
-## 3. Stage On Phone
+## 3. Stage worker in jniLibs (APK packaging)
 
-The current tested deployment folder is:
+Copy the built worker binary and NPU dispatch libraries into
+`poll-e-service/app/src/main/jniLibs/arm64-v8a/`:
 
-```text
-/data/local/tmp/poll-e-worker-test
+```bash
+cp bazel-bin/runtime/engine/litert_lm_main \
+  poll-e-service/app/src/main/jniLibs/arm64-v8a/libpoll_e_worker.so
+cp /path/to/libLiteRtDispatch_GoogleTensor.so \
+  poll-e-service/app/src/main/jniLibs/arm64-v8a/
+cp /path/to/libGemmaModelConstraintProvider.so \
+  poll-e-service/app/src/main/jniLibs/arm64-v8a/
 ```
 
-Push the binary:
+These are version-controlled (the root `.gitignore` has explicit negations
+for the jniLibs tree).
+
+At runtime the APK extracts these to the app's `nativeLibraryDir` and
+`WorkerConnection.start()` spawns the binary directly via `ProcessBuilder` with
+`LD_LIBRARY_PATH` and `--litert_dispatch_lib_dir` pointed there.  No `su` or
+root needed for the worker process itself — this keeps execution in the app's
+own SELinux/linker namespace (same approach PhoneRAG uses for EmbeddingGemma).
+
+### External dependency: model file
+
+The Gemma 3 1B model must be present on-device at:
+
+```text
+/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm
+```
+
+It was copied out of Termux private storage because the standalone shell runner
+could not read the original app-private model path.  The model is ~1.6 GB and is
+not bundled in the APK.
+
+## 4. Phone staging (legacy smoke-test reference)
+
+The `/data/local/tmp/poll-e-worker-test/` directory is retained for standalone
+smoke-testing (outside the APK) but is no longer used at APK runtime:
 
 ```bash
 adb -s 100.69.13.12:5555 shell 'mkdir -p /data/local/tmp/poll-e-worker-test'
@@ -55,8 +85,7 @@ adb -s 100.69.13.12:5555 shell \
   'chmod 755 /data/local/tmp/poll-e-worker-test/litert_lm_main'
 ```
 
-The working NPU support libraries came from the known-good LiteRT-LM test
-folder:
+NPU support libraries:
 
 ```bash
 adb -s 100.69.13.12:5555 shell '
@@ -67,16 +96,7 @@ adb -s 100.69.13.12:5555 shell '
 '
 ```
 
-The tested model path is:
-
-```text
-/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm
-```
-
-It was copied out of Termux private storage because the standalone shell runner
-could not read the original app-private model path.
-
-## 4. Smoke Test
+### Smoke test (standalone, outside APK)
 
 One-shot:
 
@@ -90,7 +110,7 @@ adb -s 100.69.13.12:5555 shell '
 '
 ```
 
-Worker:
+Worker mode:
 
 ```bash
 adb -s 100.69.13.12:5555 shell '
@@ -102,7 +122,6 @@ adb -s 100.69.13.12:5555 shell '
     --backend=npu \
     --model_path=/data/local/tmp/gemma3-1b-it-tensor-g5.litertlm \
     --poll_e_worker \
-    --poll_e_profile_file=/data/local/tmp/poll-e-worker-test/profile.txt \
     --poll_e_max_output_tokens=24
 '
 ```
@@ -139,10 +158,48 @@ export ANDROID_HOME=/home/comrade/lib/android-sdk-9123335
 adb -s 100.69.13.12:5555 install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Then on the phone:
-1. Grant root access to `com.termux.suggest` in APatch.
-2. Settings → Accessibility → Poll-E → enable.
-3. Monitor suggestions: `adb logcat -s PollE:D`
+### Signing
 
-The service spawns the worker binary via `su` when it connects. Expect ~2 s
-startup before the first suggestion can be generated.
+Production installs should use the Termux family signing key so the APK
+shares a trust domain with the rest of the `com.termux.*` suite.  The
+signing config lives in `app/build.gradle.kts` and reads from gradle
+properties (`TERMUX_KEYSTORE`, etc.).  Debug builds use the default
+debug keystore.
+
+### Phone setup
+
+1. Settings → Accessibility → Poll-E → enable.
+2. If Termux shell commands are needed in query responses, grant root
+   access to `com.termux.suggest` in APatch (`/data/adb/ap/package_config`).
+   The worker binary itself does NOT need root — only the `su -c` calls
+   that execute `ls`/`cat`/`rg`/`find` during shell-loop rounds.
+3. Monitor: `adb logcat -s PollE:D PollE/Worker:D PollE/Dispatcher:D`
+
+### Query triggers (Mode B)
+
+The service listens for `com.termux.suggest.QUERY` broadcasts.  In
+production this is sent by Keymapper on vol-down hold.  For manual
+testing:
+
+```bash
+adb -s 100.69.13.12:5555 shell 'am broadcast -a com.termux.suggest.QUERY'
+```
+
+The service reads the currently focused input field via
+`findFocus(FOCUS_INPUT)`, sends that text to the resident Gemma 3 1B
+worker, and runs the allowlisted shell loop (up to 10 rounds).  The
+final answer is posted to both the system clipboard and a notification.
+
+### semantic_search
+
+The `semantic_search` pseudo-command in the shell loop calls the
+Phone RAG service at `http://127.0.0.1:8791/query` (EmbeddingGemma
+300M, resident on NPU).  Phone RAG must be installed and running
+on the device for this to work.
+
+### Concurrent model residency
+
+Both Gemma 3 1B (Poll-E worker) and EmbeddingGemma 300M (Phone RAG)
+are resident on the Tensor G5 NPU simultaneously.  16 GB UMA on the
+Pixel 10 Pro easily holds both compiled graphs with no observed
+eviction in testing (2026-06-26).

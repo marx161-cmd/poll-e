@@ -109,7 +109,46 @@ wrapper lives in:
 /home/comrade/homelab/Poll-E/runtime-backup-2026-06-13/
 ```
 
-## 2026-06-13 Poll-E Resident Worker Patch
+## 2026-06-26 Poll-E v2 Query Dispatcher + jniLibs Worker
+
+The worker binary and NPU dispatch libraries (`libLiteRtDispatch_GoogleTensor.so`,
+`libGemmaModelConstraintProvider.so`) are now packaged as jniLibs in the APK
+(`app/src/main/jniLibs/arm64-v8a/`).  At runtime, `WorkerConnection.start()`
+spawns the binary from the app's `nativeLibraryDir` with
+`--litert_dispatch_lib_dir` pointed there.  No `su` or root needed for the
+worker — execution stays in the app's own SELinux/linker namespace.
+
+This mirrors Phone RAG's approach for EmbeddingGemma and solves the linker
+symbol error (`cannot locate symbol PermissionCache::checkPermission` in
+`libgui.so`) that occurred when the binary was spawned via `su`.
+
+### Shell loop for shell commands
+
+The QueryDispatcher's `runAllowlistedCommand()` still uses `su -c` for executing
+`ls`/`cat`/`rg`/`find` commands during query rounds (needed to reach Termux
+binaries at `/data/data/com.termux/files/usr/bin/`).  The APK must be in
+APatch's `package_config` allowlist.
+
+### QueryDispatcher fixes (2026-06-26)
+
+- `worker.request()` now has a 15-second `withTimeout` guard.
+- Command sanitizer no longer strips backslashes; args with shell-special
+  characters are single-quoted before shell execution.
+- `ANSWER:` prefix parsing is case-insensitive and tolerates extra whitespace.
+- `semantic_search` pseudo-command calls Phone RAG at `http://127.0.0.1:8791/query`.
+- `/data/local/tmp/poll-e-worker-test/` smoke tests still work, but the APK path
+  is the authoritative runtime path now.
+
+### Verified on Pixel (2026-06-26)
+
+```text
+Poll-E query: "where is the litert binary"
+→ 10-round shell loop completed
+→ Answer delivered to clipboard + notification
+→ Per-round latency: ~2000–3200 ms (cold prefill per round since KV reuse not
+  available on NPU)
+→ Gemma 3 1B + EmbeddingGemma 300M both resident on NPU simultaneously
+```
 
 Patched source tree:
 

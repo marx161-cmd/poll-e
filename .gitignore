@@ -18,7 +18,10 @@ bazel-testlogs/
 *.tar
 *.zip
 
-# Local scratch/logs
+# Android jniLibs — packaged native worker + NPU dispatch libs
+# (override the *.so block above for these specific paths)
+!poll-e-service/app/src/main/jniLibs/
+!poll-e-service/app/src/main/jniLibs/**/*.so
 *.log
 *.err
 *.tmp

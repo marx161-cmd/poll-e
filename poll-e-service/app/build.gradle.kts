@@ -15,9 +15,19 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        create("termux") {
+            storeFile = file(project.findProperty("TERMUX_KEYSTORE") as String)
+            storePassword = project.findProperty("TERMUX_STORE_PASSWORD") as String
+            keyAlias = project.findProperty("TERMUX_KEY_ALIAS") as String
+            keyPassword = project.findProperty("TERMUX_KEY_PASSWORD") as String
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("termux")
         }
     }
 

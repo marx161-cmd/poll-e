@@ -12,6 +12,7 @@
     <application
         android:label="Poll-E"
         android:allowBackup="false"
+        android:extractNativeLibs="true"
         android:supportsRtl="true">
 
         <service
